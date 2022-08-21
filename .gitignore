@@ -1,0 +1,9 @@
+ckpt 
+data
+*.pyc
+logs 
+runs/ 
+.vscode/launch.json
+checkpoints 
+tb_log/ 
+ 
