@@ -1,5 +1,5 @@
 
- download MosaicKD's pre-trained models from [Dropbox (266 M)](https://www.dropbox.com/sh/w8xehuk7debnka3/AABhoazFReE_5mMeyvb4iUWoa?dl=0) and extract them as "mosaickd/checkpoints/pretrained/*.pth"
+ download MosaicKD's pre-trained models from [Dropbox (266 M)](https://www.dropbox.com/sh/w8xehuk7debnka3/AABhoazFReE_5mMeyvb4iUWoa?dl=0) and extract them as "mosaic_core/checkpoints/pretrained/*.pth"
 
  
 * **MosaicKD (This work)**

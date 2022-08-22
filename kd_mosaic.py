@@ -5,7 +5,7 @@ import time
 import warnings
 
 from datetime import datetime
-from mosaickd import registry
+from mosaic_core import registry
 import engine
 from tqdm import tqdm
 import torch
@@ -26,14 +26,14 @@ import logging
 from torch.utils.tensorboard import SummaryWriter
 
 from PIL import PngImagePlugin
-from mosaickd.pipeline.FL import MultiTeacher, validate
+from mosaic_core.pipeline.FL import MultiTeacher, validate
 
-from mosaickd.pipeline.FL import OneTeacher
+from mosaic_core.pipeline.FL import OneTeacher
 LARGE_ENOUGH_NUMBER = 100
 PngImagePlugin.MAX_TEXT_CHUNK = LARGE_ENOUGH_NUMBER * (1024**2)
 
 parser = argparse.ArgumentParser(description='MosaicKD for OOD data')
-parser.add_argument('--data_root', default='mosaickd/data')
+parser.add_argument('--data_root', default='mosaic_core/data')
 parser.add_argument('--teacher', default='wrn40_2')
 parser.add_argument('--student', default='wrn16_1')
 parser.add_argument('--pipeline', default='mosaickd')
@@ -225,7 +225,7 @@ def main_worker(rank, ngpus_per_node, args,writer):
             args.tb.add_scalar('acc@1', float(acc1), global_step=epoch)
             is_best = acc1 > best_acc1
             best_acc1 = max(acc1, best_acc1)
-            _best_ckpt = 'mosaickd/checkpoints/MosaicKD/%s_%s_%s_%s.pth'%(args.dataset, args.unlabeled, args.teacher, args.student)
+            _best_ckpt = 'mosaic_core/checkpoints/MosaicKD/%s_%s_%s_%s.pth'%(args.dataset, args.unlabeled, args.teacher, args.student)
             if not args.multiprocessing_distributed or (args.multiprocessing_distributed
                     and args.rank % ngpus_per_node == 0):
                 save_checkpoint({
@@ -252,7 +252,7 @@ def setup_models(num_classes,args):
     ############################################
     student = registry.get_model(args.student, num_classes=num_classes)
     teacher = registry.get_model(args.teacher, num_classes=num_classes, pretrained=True).eval()
-    teacher.load_state_dict(torch.load('mosaickd/checkpoints/pretrained/%s_%s.pth'%(args.dataset, args.teacher), map_location='cpu')['state_dict'])
+    teacher.load_state_dict(torch.load('mosaic_core/checkpoints/pretrained/%s_%s.pth'%(args.dataset, args.teacher), map_location='cpu')['state_dict'])
     normalizer = engine.utils.Normalizer(**registry.NORMALIZE_DICT[args.dataset])
     args.normalizer = normalizer
 

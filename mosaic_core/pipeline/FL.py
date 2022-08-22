@@ -1,84 +1,73 @@
-import os
-import numpy as np
-import logging
-from datetime import datetime
-import torch 
-import torch.nn as nn
-import torch.optim as optim
-from torch.optim.lr_scheduler import MultiStepLR
-import torchvision
-from tensorboardX import SummaryWriter
-import copy
-import random
+from dataset import cifar
+import engine  
+
+from mosaic_core import registry 
+import numpy as np 
 import config
-import engine 
-import utils.utils as utils
-from utils.train import trainLocal
-from utils.test import validate_model
-from dataset.build_dataloader import build_dataloader
-from utils.utils import DataIter
-import dataset.cifar as cifar
+import torch 
+import os 
+import logging
+import torch.nn as nn
+from utils.utils import DataIter 
 from torch.utils.data import DataLoader
-from mosaic_core import registry
-class myFed:
-    def __init__(self, student,teacher, generator, discriminator, writer, args):
-        self.writer = writer
+import torch.optim as optim
+import utils.utils as utils
+import copy
+
+from tqdm import tqdm
+
+class OneTeacher:
+    def __init__(self,   student,teacher, generator, discriminator, args,writer):
+        self.writer=writer
         self.args = args
-        self.val_loader, self.priv_data,self.priv_ood_data, self.local_datanum, self.local_cls_datanum = build_dataloader(args)
-        
+        self.val_loader, self.priv_data,  self.local_datanum, self.local_cls_datanum = self.gen_dataset(args)
         self.local_datanum = torch.FloatTensor(self.local_datanum).cuda()
         self.local_cls_datanum = torch.FloatTensor(self.local_cls_datanum).cuda()
-
-        #model pretrain gen/dis?
         self.netG = generator
         self.normalizer = utils.Normalizer(args.dataset)
         self.netDS = utils.copy_parties(config.N_PARTIES, discriminator)
         #teacher/student
         self.netS = student
         self.init_netTS(teacher)
-        
-
+    
+    def gen_dataset(self,args):
+        num_classes, ori_training_dataset, val_dataset = registry.get_dataset(name=args.dataset, data_root=args.data_root)
+        _, train_dataset, _ = registry.get_dataset(name=args.unlabeled, data_root=args.data_root)
+        # _, ood_dataset, _ = registry.get_dataset(name=args.unlabeled, data_root=args.data_root)
+        # see Appendix Sec 2, ood data is also used for training
+        # ood_dataset.transforms = ood_dataset.transform = train_dataset.transform # w/o augmentation
+        train_dataset.transforms = train_dataset.transform = val_dataset.transform # w/ augmentation
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+             shuffle=False,
+            batch_size=config.DIS_BATCHSIZE,  num_workers=config.NUM_WORKERS)
+        # return train_dataset,ood_dataset,num_classes,ori_training_dataset,val_dataset
+        local_datanum = np.zeros(config.N_PARTIES)
+        local_cls_datanum = np.zeros((config.N_PARTIES, args.N_class))
+        for localid in range(config.N_PARTIES):
+            #count
+            local_datanum[localid] = 50000
+            #class specific count
+            for cls in range(args.N_class):
+                local_cls_datanum[localid, cls] = 5000
+        return val_loader,[train_dataset], local_datanum, local_cls_datanum 
+    
     def init_netTS(self,teacher):
         epochs = config.INIT_EPOCHS
         self.netTS = utils.copy_parties(config.N_PARTIES, teacher) #can be different
         ckpt_dir = f'{config.LOCAL_CKPTPATH}/{self.args.dataset}/a{self.args.alpha}+sd{self.args.seed}+e{epochs}+b{config.BATCHSIZE}' 
         if not os.path.isdir(ckpt_dir):
             os.mkdir(ckpt_dir)
-        
-        if not self.args.logfile=='debug':
-            for n in range(config.N_PARTIES):
-                model = self.netTS[n]
-                savename = f'{ckpt_dir}/{n}.pt'
-                if os.path.exists(savename):
-                    logging.info(f'Loading Local{n}......')
-                    utils.load_dict(savename, self.netTS[n])
-                    acc = validate_model(self.netTS[n], self.val_loader)
-                else:
-                    logging.info(f'Init Local{n}, Epoch={epochs}......')
-                    tr_dataset=self.gen_dataset_fromarray(n)
-                    train_loader = DataLoader(
-                        dataset=tr_dataset, batch_size=config.BATCHSIZE, shuffle=True, num_workers=config.NUM_WORKERS, sampler=None) 
-                    acc = trainLocal(model, train_loader, savename, test_loader=self.val_loader, writer=None)
-                logging.info(f'Init Local{n}--Epoch={epochs}, Acc:{(acc):.2f}')
-
-    def gen_dataset_fromarray(self,n):
-        if config.N_PARTIES>1:
-            tr_dataset = cifar.Dataset_fromarray(self.priv_data[n]['x'], self.priv_data[n]['y'], train=True, verbose=False)
-        else:
-            num_classes, tr_dataset, val_dataset = registry.get_dataset(name=self.args.dataset, data_root=config.MOSAIC_KD_DATA)
-        return tr_dataset
+         
     def init_training(self):
         self.local_dataloader = []
         self.local_ood_dataloader=[]
         for n in range(config.N_PARTIES):
-            tr_dataset = self.gen_dataset_fromarray( n)
+            tr_dataset = self.priv_data[n]
             local_loader = DataLoader(
                         dataset=tr_dataset, batch_size=config.DIS_BATCHSIZE, shuffle=True, num_workers=config.NUM_WORKERS, sampler=None) 
             self.local_dataloader.append(DataIter(local_loader))
-            ood_dataset = cifar.Dataset_fromarray(self.priv_ood_data[n]['x'], self.priv_ood_data[n]['y'], train=True, verbose=False)
-            local_ood_loader = DataLoader(
-                        dataset=ood_dataset, batch_size=config.DIS_BATCHSIZE, shuffle=True, num_workers=config.NUM_WORKERS, sampler=None) 
-            self.local_ood_dataloader.append(DataIter(local_ood_loader))
+             
 
         self.iters_per_round = min([len(local_loader.dataloader) for local_loader in self.local_dataloader])#4~9
         # import ipdb; ipdb.set_trace()
@@ -91,7 +80,7 @@ class myFed:
             self.optim_s = optim.Adam(
                 self.netS.parameters(), lr=config.DIS_LR,  betas=(0.9, 0.999), weight_decay=config.DIS_WD)
         self.sched_s = optim.lr_scheduler.CosineAnnealingLR(
-                self.optim_s, steps_all, eta_min=config.DIS_LR_MIN,)
+                self.optim_s, steps_all)#TODO, eta_min=config.DIS_LR_MIN,
         #for gen
         self.optim_g = torch.optim.Adam(self.netG.parameters(), lr=config.GEN_LR, betas=[0.5, 0.999])
         self.sched_g = torch.optim.lr_scheduler.CosineAnnealingLR(self.optim_g, T_max=steps_all )
@@ -105,7 +94,8 @@ class myFed:
         # import ipdb; ipdb.set_trace()
 
         #criterion
-        self.criterion_distill = nn.L1Loss(reduce='mean')
+        # self.criterion_distill = nn.L1Loss(reduce='mean')
+        self.criterion=nn.CrossEntropyLoss().cuda()
         self.criterion_bce = nn.functional.binary_cross_entropy_with_logits
 
         #netS training records
@@ -116,7 +106,7 @@ class myFed:
         self.savedir_gen = f'{config.CKPTPATH}/{self.args.logfile}/gen'
         if not os.path.isdir(self.savedir_gen):
             os.makedirs(self.savedir_gen)
-        
+            
     def update(self):
         self.init_training()
         self.global_step = 0
@@ -125,26 +115,28 @@ class myFed:
         self.localweight = self.local_datanum/self.local_datanum.sum()#nlocal*nclass
         self.localclsweight = self.local_cls_datanum/self.local_cls_datanum.sum(dim=0)#nlocal*nclass
 
-        for round in range(config.ROUNDS):
-            if config.LOCAL_PERCENT<1:    
-                selectN = random.sample(selectN, 
-                                        int(config.LOCAL_PERCENT*config.N_PARTIES))
-                countN = self.local_datanum[selectN]
-                self.localweight = countN/countN.sum() #nlocal
-                countN = self.local_cls_datanum[selectN]
-                self.localclsweight = countN/countN.sum(dim=0)#nlocal*nclass
-                
+        for round in range(config.ROUNDS): 
             logging.info(f'************Start Round{round}***************')
             self.update_round(round, selectN)
         #save G,D
         torch.save(self.netG.state_dict(), f'{self.savedir_gen}/generator.pt') 
         for n in range(config.N_PARTIES):
              torch.save(self.netDS[n].state_dict(), f'{self.savedir_gen}/discrim{n}.pt') 
-
+             
+             
+    def change_status_to_train(self):
+        
+        self.netG.train() 
+        for n in range(config.N_PARTIES):
+            self.netDS[n].train() 
+            self.netTS[n].eval()
+        self.netS.train() 
+        
     def update_round(self, roundd, selectN):
         #
+        self.change_status_to_train()
         bestacc_round = self.bestacc
-        for iter in range(self.iters_per_round):
+        for iter in tqdm(range(self.iters_per_round)):
             #1. update D,G
             z = torch.randn(size=(config.DIS_BATCHSIZE, config.GEN_Z_DIM)).cuda()
             syn_img = self.netG(z)
@@ -153,16 +145,19 @@ class myFed:
             self.update_netG_batch(syn_img, selectN)
             #2. Distill, update S
             self.update_netS_batch(selectN)
-
+            
+            self.sched_d.step()
+            self.sched_g.step()
+            self.sched_s.step()
             #val
-        acc = validate_model(self.netS, self.val_loader)
+        acc = validate(self.optim_s.param_groups[0]['lr'], self.val_loader, self.netS, self.criterion, self.args,roundd)
         self.global_step += 1
         if acc>bestacc_round:
             logging.info(f'Iter{iter}, best for now:{acc}')
             self.best_statdict = copy.deepcopy(self.netS.state_dict())
             bestacc_round = acc
-        if iter % config.PRINT_FREQ == 0:
-            logging.info(f'===R{roundd}, {iter}/{self.iters_per_round}, acc{acc}, best{self.bestacc}')
+            # if iter % config.PRINT_FREQ == 0:
+            #     logging.info(f'===R{roundd}, {iter}/{self.iters_per_round}, acc{acc}, best{self.bestacc}')
                 
         #reload G,D?
         # self.netS.load_state_dict(self.best_statdict, strict=True)
@@ -175,14 +170,14 @@ class myFed:
         
         if self.writer is not None:
             self.writer.add_scalar('BestACC', self.bestacc, roundd)
-
+            
     def update_netDS_batch(self, syn_img, selectN):
         loss = 0.
         for localid in selectN:
             d_out_fake = self.netDS[localid](syn_img.detach())
             real_img = self.local_dataloader[localid].next()[0].cuda()#list [img, label, ?]
-            d_out_real = self.netDS[localid](real_img)
-            loss_d = (self.criterion_bce(d_out_fake.detach(), torch.zeros_like(d_out_fake), reduction='sum') + \
+            d_out_real = self.netDS[localid](real_img.detach())
+            loss_d = (self.criterion_bce(d_out_fake, torch.zeros_like(d_out_fake), reduction='sum') + \
                 self.criterion_bce(d_out_real, torch.ones_like(d_out_real), reduction='sum'))/  (2*len(d_out_fake))  
             loss += loss_d
         loss *= self.args.w_disc
@@ -190,23 +185,27 @@ class myFed:
         self.optim_d.zero_grad()
         loss.backward()
         self.optim_d.step()
-        self.sched_d.step()
+        
 
         if self.writer is not None:
             self.writer.add_scalar('LossDiscriminator', loss.item(), self.global_step)
-        
+            
     def update_netG_batch(self, syn_img, selectN):
         #1. gan loss
-        loss_gan = 0.
+        loss_gan = []
         for localid in selectN:
             d_out_fake = self.netDS[localid](syn_img)#gradients in syn
-            loss_gan += self.criterion_bce(d_out_fake, torch.ones_like(d_out_fake), reduction='mean')
+            loss_gan.append( self.criterion_bce(d_out_fake, torch.ones_like(d_out_fake), reduction='sum') / len(d_out_fake))
+        if self.args.is_emsember_generator_GAN_loss=="y":
+            loss_gan= self.ensemble_locals(torch.stack(loss_gan))
+        else:
+            loss_gan= torch.sum(torch.stack(loss_gan ))
         
         #2. adversarial distill loss
         logits_T = self.forward_teacher_outs(syn_img, selectN)
         ensemble_logits_T = self.ensemble_locals(logits_T)
         logits_S = self.netS(syn_img)
-        loss_adv =- engine.criterions.kldiv(logits_S, ensemble_logits_T)  # - self.criterion_distill(logits_S, ensemble_logits_T) #(bs, ncls) 
+        loss_adv = -engine.criterions.kldiv(logits_S, ensemble_logits_T)  # - self.criterion_distill(logits_S, ensemble_logits_T) #(bs, ncls) 
         #3.regularization for each t_out (not ensembled) #TO DISCUSS
         loss_align = []
         loss_balance = []
@@ -232,14 +231,13 @@ class myFed:
         self.optim_g.zero_grad()
         loss.backward()
         self.optim_g.step()
-        self.sched_g.step()
+        
 
         if self.writer is not None:
             self.writer.add_scalars('LossGen', {'loss_gan': loss_gan.item(), 
                                                 'loss_adv': loss_adv.item(), 
                                                 'loss_align': loss_align.item(), 
                                                 'loss_balance': loss_balance.item()}, self.global_step)
-
     def forward_teacher_outs(self, images, localN=None):
         if localN is None: #use central as teacher
             total_logits = self.netS(images).detach()
@@ -247,10 +245,8 @@ class myFed:
             #get local
             total_logits = []
             for n in localN:
-                tmodel = copy.deepcopy(self.netTS[n])
-                logits = tmodel(images).detach()
+                logits=self.netTS[n](images)
                 total_logits.append(logits)
-                del tmodel
             total_logits = torch.stack(total_logits) #nlocal*batch*ncls       
         return total_logits
     
@@ -267,20 +263,19 @@ class myFed:
         elif len(locals.shape)==1:
             ensembled = (locals*self.localweight).sum() #1
         return ensembled
-    
     def update_netS_batch(self, selectN):
         for _ in range(5): 
             with torch.no_grad():
                 z = torch.randn(size=(config.DIS_BATCHSIZE, config.GEN_Z_DIM)).cuda()
                 syn_img = self.netG(z)
                 syn_img = self.normalizer(syn_img)
-                ood_images = self.local_ood_dataloader[0].next()[0].cuda()
-                images = torch.cat([syn_img, ood_images])
+                logits_T = self.ensemble_locals(self.forward_teacher_outs(syn_img, selectN))
+                 
             #
-            kd_img=syn_img
-            self.netS.train()
-            loigts_S = self.netS(kd_img)
-            logits_T = self.ensemble_locals(self.forward_teacher_outs(kd_img, selectN))
+      
+             
+            loigts_S = self.netS(syn_img.detach())
+            
             # loss =   self.criterion_distill(loigts_S, logits_T) #
             loss=engine.criterions.kldiv(loigts_S, logits_T.detach() )
             loss *= self.args.w_dist
@@ -288,7 +283,124 @@ class myFed:
             self.optim_s.zero_grad()
             loss.backward()
             self.optim_s.step()
-            self.sched_s.step()
+            
 
             if self.writer is not None:
                 self.writer.add_scalar('LossDistill', loss.item(), self.global_step)
+    
+    
+
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res    
+
+def validate(current_lr, val_loader, model, criterion, args,current_epoch):
+    losses = AverageMeter('Loss', ':.4e')
+    top1 = AverageMeter('Acc@1', ':6.2f')
+    top5 = AverageMeter('Acc@5', ':6.2f')
+    model.eval()
+    with torch.no_grad():
+        for i, (images, target) in enumerate(val_loader):
+            if args.gpu is not None:
+                images = images.cuda(args.gpu, non_blocking=True)
+            if torch.cuda.is_available():
+                target = target.cuda(args.gpu, non_blocking=True)
+            output = model(images)
+            loss = criterion(output, target)
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            losses.update(loss.item(), images.size(0))
+            top1.update(acc1[0], images.size(0))
+            top5.update(acc5[0], images.size(0))
+        if args.rank<=0:
+            args.logger.info(' [Eval] Epoch={current_epoch} Acc@1={top1.avg:.4f} Acc@5={top5.avg:.4f} Loss={losses.avg:.4f} Lr={lr:.4f}'
+                .format(current_epoch= current_epoch, top1=top1, top5=top5, losses=losses, lr=current_lr))
+    return top1.avg
+    
+    
+
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+    def __init__(self, name, fmt=':f'):
+        self.name = name
+        self.fmt = fmt
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+    def __str__(self):
+        fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
+        return fmtstr.format(**self.__dict__)
+
+
+class ProgressMeter(object):
+    def __init__(self, num_batches, meters, prefix=""):
+        self.batch_fmtstr = self._get_batch_fmtstr(num_batches)
+        self.meters = meters
+        self.prefix = prefix
+
+    def display(self, batch):
+        entries = [self.prefix + self.batch_fmtstr.format(batch)]
+        entries += [str(meter) for meter in self.meters]
+        print('\t'.join(entries))
+
+    def _get_batch_fmtstr(self, num_batches):
+        num_digits = len(str(num_batches // 1))
+        fmt = '{:' + str(num_digits) + 'd}'
+        return '[' + fmt + '/' + fmt.format(num_batches) + ']'
+
+    
+class MultiTeacher(OneTeacher):
+    # def __init__(self,  args):
+    #     pass 
+    
+    def gen_dataset(self,args):
+        
+        priv_train_data,ori_training_dataset, test_dataset = cifar.dirichlet_datasplit(
+            args, privtype=args.dataset)
+        local_dataset = []
+        for n in range(config.N_PARTIES):
+            tr_dataset  = cifar.Dataset_fromarray(priv_train_data[n]['x'], priv_train_data[n]['y'], train=True, verbose=False)
+            local_dataset.append(tr_dataset)
+        
+        num_classes, ori_training_dataset, val_dataset = registry.get_dataset(name=args.dataset, data_root=args.data_root)
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+             shuffle=False,
+            batch_size=config.DIS_BATCHSIZE,  num_workers=config.NUM_WORKERS)
+        local_datanum = np.zeros(config.N_PARTIES)
+        local_cls_datanum = np.zeros((config.N_PARTIES, self.args.N_class))
+        for localid in range(config.N_PARTIES):
+            #count
+            local_datanum[localid] = priv_train_data[localid]['x'].shape[0]
+            #class specific count
+            for cls in range(args.N_class):
+                local_cls_datanum[localid, cls] = (priv_train_data[localid]['y']==cls).sum()
+            
+            
+        assert sum(local_datanum) == 50000
+        assert sum(sum(local_cls_datanum)) == 50000
+        return val_loader,local_dataset, local_datanum, local_cls_datanum 
+        
+         

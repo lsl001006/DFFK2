@@ -1,0 +1,5 @@
+termcolor
+tqdm
+scipy
+pandas
+tensorboard
