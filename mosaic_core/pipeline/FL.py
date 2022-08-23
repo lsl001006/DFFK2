@@ -17,7 +17,7 @@ import copy
 from tqdm import tqdm
 
 class OneTeacher:
-    def __init__(self,   student,teacher, generator, discriminator, args,writer):
+    def __init__(self, student, teacher, generator, discriminator, args,writer):
         self.writer=writer
         self.args = args
         self.val_loader, self.priv_data,  self.local_datanum, self.local_cls_datanum = self.gen_dataset(args)
@@ -71,7 +71,7 @@ class OneTeacher:
 
         self.iters_per_round = min([len(local_loader.dataloader) for local_loader in self.local_dataloader])#4~9
         # import ipdb; ipdb.set_trace()
-        steps_all = config.ROUNDS*self.iters_per_round
+        steps_all = self.args.epochs*self.iters_per_round
         #init optim
         if config.OPTIMIZER == 'SGD':
             self.optim_s = optim.SGD(
@@ -114,14 +114,55 @@ class OneTeacher:
         selectN = list(range(0, config.N_PARTIES))
         self.localweight = self.local_datanum/self.local_datanum.sum()#nlocal*nclass
         self.localclsweight = self.local_cls_datanum/self.local_cls_datanum.sum(dim=0)#nlocal*nclass
-
-        for round in range(config.ROUNDS): 
-            logging.info(f'************Start Round{round}***************')
+        # resume trainning if args.resume exists
+        self.resume_trainning()
+        for round in range(self.args.start_epoch, self.args.epochs): 
+            logging.info(f'************Start Round {round} -->> {self.args.epochs}***************')
             self.update_round(round, selectN)
         #save G,D
         torch.save(self.netG.state_dict(), f'{self.savedir_gen}/generator.pt') 
         for n in range(config.N_PARTIES):
-             torch.save(self.netDS[n].state_dict(), f'{self.savedir_gen}/discrim{n}.pt') 
+             torch.save(self.netDS[n].state_dict(), f'{self.savedir_gen}/discrim{n}.pt')
+
+    def resume_trainning(self):
+        ############################################
+        # Resume Train from checkpoints
+        ############################################
+        if self.args.resume:
+            if os.path.isfile(self.args.resume):
+                print("=> loading checkpoint '{}'".format(self.args.resume))
+                if self.args.gpu is None:
+                    checkpoint = torch.load(self.args.resume)
+                else:
+                    # Map model to be loaded to specified single gpu.
+                    loc = 'cuda:{}'.format(self.args.gpu)
+                    checkpoint = torch.load(self.args.resume, map_location=loc)
+                
+                try:
+                    self.netS.module.load_state_dict(checkpoint['s_state_dict'])
+                    self.netG.module.load_state_dict(checkpoint['g_state_dict'])
+                    for n in range(config.N_PARTIES):
+                        self.netDS[n].module.load_state_dict(checkpoint['ds_state_dict'][n])
+                except:
+                    self.netS.load_state_dict(checkpoint['s_state_dict'])
+                    self.netG.load_state_dict(checkpoint['g_state_dict'])
+                    for n in range(config.N_PARTIES):
+                        self.netDS[n].load_state_dict(checkpoint['ds_state_dict'][n])
+                best_acc1 = checkpoint['best_acc']
+                try: 
+                    self.args.start_epoch = checkpoint['epoch']
+                    self.optim_g.load_state_dict(checkpoint['optim_g'])
+                    self.sched_g.load_state_dict(checkpoint['sched_g'])
+                    self.optim_s.load_state_dict(checkpoint['optim_s'])
+                    self.sched_s.load_state_dict(checkpoint['sched_s'])
+                    self.sched_d.load_state_dict(checkpoint['sched_d'])
+                    self.optim_d.load_state_dict(checkpoint['optim_d'])
+                except: 
+                    print("Fails to load additional model information")
+                print("[!] loaded checkpoint '{}' (epoch {} acc {})"
+                    .format(self.args.resume, checkpoint['epoch'], best_acc1))
+            else:
+                print("[!] no checkpoint found at '{}'".format(self.args.resume)) 
              
              
     def change_status_to_train(self):
@@ -152,10 +193,12 @@ class OneTeacher:
             #val
         acc = validate(self.optim_s.param_groups[0]['lr'], self.val_loader, self.netS, self.criterion, self.args,roundd)
         self.global_step += 1
+        is_best = False
         if acc>bestacc_round:
             logging.info(f'Iter{iter}, best for now:{acc}')
             self.best_statdict = copy.deepcopy(self.netS.state_dict())
             bestacc_round = acc
+            is_best = True
             # if iter % config.PRINT_FREQ == 0:
             #     logging.info(f'===R{roundd}, {iter}/{self.iters_per_round}, acc{acc}, best{self.bestacc}')
                 
@@ -170,6 +213,26 @@ class OneTeacher:
         
         if self.writer is not None:
             self.writer.add_scalar('BestACC', self.bestacc, roundd)
+        
+        checkpoints = {
+            "epoch":roundd+1,
+            "arch":self.args.student,
+            "s_state_dict":self.best_statdict,
+            "g_state_dict":self.netG.state_dict(),
+            "ds_state_dict":[self.netDS[i].state_dict() for i in range(config.N_PARTIES)],
+            "best_acc":float(bestacc_round),
+            "optim_s":self.optim_s.state_dict(),
+            "optim_g":self.optim_g.state_dict(),
+            "optim_d":self.optim_d.state_dict(),
+            "sched_d":self.sched_d.state_dict(),
+            "sched_s":self.sched_s.state_dict(),
+            "sched_g":self.sched_g.state_dict()
+        }
+        save_checkpoint(checkpoints, 
+                        is_best, 
+                        self.args.ckpt_path, 
+                        filename=f'E{roundd}-Dbs{config.DIS_BATCHSIZE}-Ts{config.N_PARTIES}-ACC{round(float(self.bestacc),2)}.pth')
+        
             
     def update_netDS_batch(self, syn_img, selectN):
         loss = 0.
@@ -186,7 +249,6 @@ class OneTeacher:
         loss.backward()
         self.optim_d.step()
         
-
         if self.writer is not None:
             self.writer.add_scalar('LossDiscriminator', loss.item(), self.global_step)
             
@@ -232,12 +294,13 @@ class OneTeacher:
         loss.backward()
         self.optim_g.step()
         
-
         if self.writer is not None:
             self.writer.add_scalars('LossGen', {'loss_gan': loss_gan.item(), 
                                                 'loss_adv': loss_adv.item(), 
                                                 'loss_align': loss_align.item(), 
                                                 'loss_balance': loss_balance.item()}, self.global_step)
+
+
     def forward_teacher_outs(self, images, localN=None):
         if localN is None: #use central as teacher
             total_logits = self.netS(images).detach()
@@ -263,6 +326,8 @@ class OneTeacher:
         elif len(locals.shape)==1:
             ensembled = (locals*self.localweight).sum() #1
         return ensembled
+
+
     def update_netS_batch(self, selectN):
         for _ in range(5): 
             with torch.no_grad():
@@ -272,8 +337,6 @@ class OneTeacher:
                 logits_T = self.ensemble_locals(self.forward_teacher_outs(syn_img, selectN))
                  
             #
-      
-             
             loigts_S = self.netS(syn_img.detach())
             
             # loss =   self.criterion_distill(loigts_S, logits_T) #
@@ -287,8 +350,12 @@ class OneTeacher:
 
             if self.writer is not None:
                 self.writer.add_scalar('LossDistill', loss.item(), self.global_step)
-    
-    
+
+
+def save_checkpoint(state, is_best, save_dir, filename='checkpoint.pth'):
+    if is_best:
+        torch.save(state, os.path.join(save_dir, filename))  
+        print(f'[saved] ckpt saved to {os.path.join(save_dir, filename)}')
 
 def accuracy(output, target, topk=(1,)):
     """Computes the accuracy over the k top predictions for the specified values of k"""
