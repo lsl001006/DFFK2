@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 import torch.optim as optim
 import utils.utils as utils
 import copy
+import random
 
 from tqdm import tqdm
 
@@ -125,6 +126,13 @@ class OneTeacher:
         else:
             self.args.autocast = engine.utils.dummy_ctx
         for round in range(self.args.start_epoch, self.args.epochs):
+            if config.LOCAL_PERCENT < 1:    
+                selectN = random.sample(selectN, 
+                                        int(config.LOCAL_PERCENT*config.N_PARTIES))
+                countN = self.local_datanum[selectN]
+                self.localweight = countN/countN.sum() #nlocal
+                countN = self.local_cls_datanum[selectN]
+                self.localclsweight = countN/countN.sum(dim=0)#nlocal*nclass
             logging.info(f'************Start Round {round} -->> {self.args.epochs}***************')
             self.update_round(round, selectN)
         # save G,D
@@ -159,6 +167,7 @@ class OneTeacher:
                 best_acc1 = checkpoint['best_acc']
                 try:
                     self.args.start_epoch = checkpoint['epoch']
+                    self.bestacc = checkpoint['best_acc']
                     self.optim_g.load_state_dict(checkpoint['optim_g'])
                     self.sched_g.load_state_dict(checkpoint['sched_g'])
                     self.optim_s.load_state_dict(checkpoint['optim_s'])
@@ -217,6 +226,7 @@ class OneTeacher:
             f'=============Round{roundd}, BestAcc originate: {(self.bestacc):.2f}, to{(bestacc_round):.2f}====================')
 
         if bestacc_round > self.bestacc:
+            print(f'selectN:{selectN}')
             savename = os.path.join(self.savedir, f'r{roundd}_{(bestacc_round):.2f}.pt')
             torch.save(self.best_statdict, savename)
             self.bestacc = bestacc_round
@@ -245,7 +255,7 @@ class OneTeacher:
 
     def update_netDS_batch(self, syn_img, selectN):
         loss = 0.
-        with self.args.autocast:
+        with self.args.autocast():
             for localid in selectN:
                 d_out_fake = self.netDS[localid](syn_img.detach())
                 real_img = self.local_dataloader[localid].next()[0].cuda()  # list [img, label, ?]
@@ -274,7 +284,7 @@ class OneTeacher:
     def update_netG_batch(self, syn_img, selectN):
         # 1. gan loss
         loss_gan = []
-        with self.args.autocast:
+        with self.args.autocast():
             for localid in selectN:
                 d_out_fake = self.netDS[localid](syn_img)  # gradients in syn
                 loss_gan.append(self.criterion_bce(d_out_fake, torch.ones_like(d_out_fake),
@@ -358,7 +368,7 @@ class OneTeacher:
 
     def update_netS_batch(self, selectN):
         for _ in range(5):
-            with self.args.autocast:
+            with self.args.autocast():
                 with torch.no_grad():
                     z = torch.randn(size=(config.DIS_BATCHSIZE, config.GEN_Z_DIM)).cuda()
                     syn_img = self.netG(z)
@@ -390,6 +400,8 @@ def save_checkpoint(state, is_best, save_dir, filename='checkpoint.pth'):
     if is_best:
         torch.save(state, os.path.join(save_dir, filename))
         print(f'[saved] ckpt saved to {os.path.join(save_dir, filename)}')
+    else:
+        torch.save(state, os.path.join(save_dir, 'latest.pth'))
 
 
 def accuracy(output, target, topk=(1,)):
