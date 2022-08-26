@@ -265,7 +265,8 @@ class OneTeacher:
                                      2 * len(d_out_fake))
                 loss += loss_d
             loss *= self.args.w_disc
-
+            
+        self.optim_d.zero_grad()
         if self.args.fp16:
             scaler_d = self.args.scaler_d
             scaler_d.scale(loss).backward()
@@ -274,7 +275,7 @@ class OneTeacher:
         else:
             loss.backward()
             self.optim_d.step()
-        # self.optim_d.zero_grad()
+        # 
         # loss.backward()
         # self.optim_d.step()
 
