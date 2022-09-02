@@ -34,7 +34,7 @@ MODEL_DICT = {
     'resnet18':  classifiers.resnet.resnet18,
     'resnet34':  classifiers.resnet.resnet34,
     'vgg11': classifiers.vgg.vgg11_bn,
-    #'resnet8': classifiers.resnet_tiny.resnet8,
+    'resnet8': classifiers.resnet_tiny.resnet8,
     #'resnet20': classifiers.resnet_tiny.resnet20,
     #'resnet32': classifiers.resnet_tiny.resnet32,
     #'resnet56': classifiers.resnet_tiny.resnet56,

@@ -35,7 +35,7 @@ PngImagePlugin.MAX_TEXT_CHUNK = LARGE_ENOUGH_NUMBER * (1024**2)
 parser = argparse.ArgumentParser(description='MosaicKD for OOD data')
 parser.add_argument('--data_root', default='mosaic_core/data')
 parser.add_argument('--teacher', default='wrn40_2')
-parser.add_argument('--student', default='resnet18')
+parser.add_argument('--student', default='resnet8')
 parser.add_argument('--pipeline', default='mosaickd')
 parser.add_argument('--N_class', type=int, default=10)  # 10
 parser.add_argument('--dataset', default='cifar10')
